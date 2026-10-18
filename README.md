@@ -172,6 +172,17 @@ Check these first:
 
 Tip on Windows: if values come from PowerShell environment variables, remove accidental quotes and trailing spaces.
 
+### Template placeholders are ignored
+
+Values copied unchanged from `.env.example` (e.g. `your-content-understanding-key`, `AccountName=...`, `<key>`)
+are treated as **not set**, and a warning is logged. The tool then falls back to `DefaultAzureCredential`
+(Content Understanding) and `AZURE_STORAGE_ACCOUNT_URL` (Blob Storage).
+
+### `Blob Storage authentication failed` / `Access denied (403)`
+
+When using `AZURE_STORAGE_ACCOUNT_URL` you must be signed in (`az login`) with an identity that has the
+**Storage Blob Data Contributor** role on the storage account. Owner/Contributor alone is not enough for blob data.
+
 ## Notes
 
 - Local skip check is based solely on existence of `<pdf>.json`, allowing offline test of skip logic without Azure credentials.

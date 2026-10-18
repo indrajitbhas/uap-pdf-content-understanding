@@ -27,7 +27,13 @@ else:  # Python 3.9: typing_extensions is installed as a dependency of azure-cor
     from typing_extensions import TypeGuard
 
 from azure.core.credentials import AzureKeyCredential
-from azure.core.exceptions import AzureError, ResourceExistsError, ServiceResponseError
+from azure.core.exceptions import (
+    AzureError,
+    ClientAuthenticationError,
+    HttpResponseError,
+    ResourceExistsError,
+    ServiceResponseError,
+)
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from azure.ai.contentunderstanding import ContentUnderstandingClient
@@ -111,10 +117,22 @@ def _is_real_secret(value: Optional[str]) -> TypeGuard[str]:
     """True if value is a non-empty, non-placeholder string (narrows the type to str)."""
     if value is None:
         return False
-    normalized = value.strip()
+    normalized = value.strip().strip('"').strip("'").strip()
     if not normalized:
         return False
-    return normalized.lower() not in PLACEHOLDER_VALUES
+    lowered = normalized.lower()
+    if lowered in PLACEHOLDER_VALUES:
+        return False
+    # Template values such as "your-content-understanding-key", "<key>" or "AccountName=...;"
+    if lowered.startswith(("your-", "your_", "<")) or "..." in normalized:
+        return False
+    return True
+
+
+def _warn_if_placeholder(name: str, value: Optional[str]) -> None:
+    """Log a warning when a variable is set but still holds a template placeholder."""
+    if value and not _is_real_secret(value):
+        LOGGER.warning("%s looks like a template placeholder and will be ignored.", name)
 
 
 def _is_valid_container_name(value: str) -> bool:
@@ -313,6 +331,8 @@ def _build_config(args: argparse.Namespace) -> AppConfig:
 
 
 def _build_runtime_clients(config: AppConfig) -> RuntimeClients:
+    _warn_if_placeholder("CONTENT_UNDERSTANDING_KEY", config.content_understanding_key)
+    _warn_if_placeholder("AZURE_STORAGE_CONNECTION_STRING", config.storage_connection_string)
     _validate_storage_settings(config)
 
     if not config.endpoint:
@@ -373,6 +393,20 @@ def _ensure_containers(clients: RuntimeClients) -> None:
                 f"'{container_name}'. This usually means a malformed storage account URL/connection string "
                 "(for example an invalid account name label)."
             ) from exc
+        except ClientAuthenticationError as exc:
+            raise ValueError(
+                "Blob Storage authentication failed. Either set a real AZURE_STORAGE_CONNECTION_STRING, "
+                "or sign in for DefaultAzureCredential (e.g. run 'az login') with an identity that has the "
+                f"'Storage Blob Data Contributor' role on the storage account. Details: {exc.message}"
+            ) from exc
+        except HttpResponseError as exc:
+            if exc.status_code == 403:
+                raise ValueError(
+                    f"Access denied (403) to container '{container_name}'. Grant your identity the "
+                    "'Storage Blob Data Contributor' role on the storage account (role changes can take a few "
+                    "minutes), or use AZURE_STORAGE_CONNECTION_STRING."
+                ) from exc
+            raise
 
 
 def _process_one_file(plan: PlannedFile, config: AppConfig, clients: RuntimeClients) -> FileOutcome:
@@ -481,6 +515,8 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
+    # Silence per-request HTTP logs from the Azure SDK; keep warnings and errors.
+    logging.getLogger("azure").setLevel(logging.WARNING)
 
     try:
         config = _build_config(args)
