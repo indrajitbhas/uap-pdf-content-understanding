@@ -154,6 +154,24 @@ Summary:
   failed:   Z
 ```
 
+## Troubleshooting
+
+### `URL has an invalid label` when creating containers
+
+This usually means Blob Storage endpoint settings are malformed.
+
+Check these first:
+
+- `AZURE_STORAGE_CONNECTION_STRING`
+  - `AccountName` must be **3-24 lowercase letters/digits only** (no uppercase, underscore, spaces).
+  - If `BlobEndpoint` is present, it must be a valid URL like `https://<account>.blob.core.windows.net`.
+- `AZURE_STORAGE_ACCOUNT_URL`
+  - Must be a valid URL like `https://<account>.blob.core.windows.net`.
+- Container names (`PDFS_CONTAINER`, `RESULTS_CONTAINER`)
+  - 3-63 chars, lowercase letters/digits/hyphen, start/end with letter or digit, no `--`.
+
+Tip on Windows: if values come from PowerShell environment variables, remove accidental quotes and trailing spaces.
+
 ## Notes
 
 - Local skip check is based solely on existence of `<pdf>.json`, allowing offline test of skip logic without Azure credentials.

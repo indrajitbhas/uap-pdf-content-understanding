@@ -12,12 +12,14 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 if sys.version_info >= (3, 10):
     from typing import TypeGuard
@@ -25,7 +27,7 @@ else:  # Python 3.9: typing_extensions is installed as a dependency of azure-cor
     from typing_extensions import TypeGuard
 
 from azure.core.credentials import AzureKeyCredential
-from azure.core.exceptions import AzureError, ResourceExistsError
+from azure.core.exceptions import AzureError, ResourceExistsError, ServiceResponseError
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from azure.ai.contentunderstanding import ContentUnderstandingClient
@@ -47,6 +49,8 @@ PLACEHOLDER_VALUES = {
     "none",
     "null",
 }
+CONTAINER_NAME_RE = re.compile(r"^(?!.*--)[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$")
+STORAGE_ACCOUNT_RE = re.compile(r"^[a-z0-9]{3,24}$")
 
 
 @dataclass(frozen=True)
@@ -111,6 +115,85 @@ def _is_real_secret(value: Optional[str]) -> TypeGuard[str]:
     if not normalized:
         return False
     return normalized.lower() not in PLACEHOLDER_VALUES
+
+
+def _is_valid_container_name(value: str) -> bool:
+    """Azure Blob container naming rules (subset): 3-63, lowercase alnum/hyphen."""
+    return bool(CONTAINER_NAME_RE.fullmatch(value))
+
+
+def _is_valid_dns_host(hostname: str) -> bool:
+    """Best-effort DNS hostname validation for account URLs/endpoints."""
+    if not hostname or len(hostname) > 253:
+        return False
+    labels = hostname.split(".")
+    label_re = re.compile(r"^[A-Za-z0-9-]{1,63}$")
+    for label in labels:
+        if not label:
+            return False
+        if not label_re.fullmatch(label):
+            return False
+        if label.startswith("-") or label.endswith("-"):
+            return False
+    return True
+
+
+def _conn_str_dict(conn_str: str) -> dict[str, str]:
+    """Parse Azure connection string into key/value pairs (case-sensitive keys)."""
+    pairs: dict[str, str] = {}
+    for part in conn_str.split(";"):
+        if not part:
+            continue
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        pairs[key.strip()] = value.strip()
+    return pairs
+
+
+def _validate_storage_settings(config: AppConfig) -> None:
+    """Validate container names and storage endpoint/account settings before any network call."""
+    for name, label in ((config.pdfs_container, "PDFS_CONTAINER"), (config.results_container, "RESULTS_CONTAINER")):
+        if not _is_valid_container_name(name):
+            raise ValueError(
+                f"Invalid {label}='{name}'. Container names must be 3-63 chars, lowercase letters/numbers/hyphens, "
+                "start/end with letter or number, and not contain consecutive hyphens."
+            )
+
+    if _is_real_secret(config.storage_connection_string):
+        conn_values = _conn_str_dict(config.storage_connection_string)
+        account_name = conn_values.get("AccountName", "")
+        blob_endpoint = conn_values.get("BlobEndpoint", "")
+
+        if account_name and not STORAGE_ACCOUNT_RE.fullmatch(account_name):
+            raise ValueError(
+                f"Invalid storage AccountName='{account_name}' in AZURE_STORAGE_CONNECTION_STRING. "
+                "Use only lowercase letters and digits, length 3-24."
+            )
+
+        if blob_endpoint:
+            parsed = urlparse(blob_endpoint)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or not _is_valid_dns_host(parsed.hostname or ""):
+                raise ValueError(
+                    "Invalid BlobEndpoint in AZURE_STORAGE_CONNECTION_STRING. "
+                    "Expected a valid URL like 'https://<account>.blob.core.windows.net'."
+                )
+
+        return
+
+    if not config.storage_account_url:
+        raise ValueError(
+            "Missing blob storage auth. Set AZURE_STORAGE_CONNECTION_STRING or "
+            "AZURE_STORAGE_ACCOUNT_URL (with DefaultAzureCredential available)."
+        )
+
+    parsed = urlparse(config.storage_account_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not _is_valid_dns_host(parsed.hostname or ""):
+        raise ValueError(
+            f"Invalid AZURE_STORAGE_ACCOUNT_URL='{config.storage_account_url}'. "
+            "Expected a valid URL like 'https://<account>.blob.core.windows.net'."
+        )
+
 
 
 def _rel_blob_path(pdf_path: Path, root_folder: Path) -> str:
@@ -230,6 +313,8 @@ def _build_config(args: argparse.Namespace) -> AppConfig:
 
 
 def _build_runtime_clients(config: AppConfig) -> RuntimeClients:
+    _validate_storage_settings(config)
+
     if not config.endpoint:
         raise ValueError("Missing endpoint. Provide --endpoint or AZURE_CONTENT_UNDERSTANDING_ENDPOINT.")
     if not config.analyzer_id:
@@ -282,6 +367,12 @@ def _ensure_containers(clients: RuntimeClients) -> None:
             LOGGER.info("Created container: %s", container_name)
         except ResourceExistsError:
             LOGGER.info("Verified container exists: %s", container_name)
+        except ServiceResponseError as exc:
+            raise ValueError(
+                "Could not reach Azure Blob endpoint while creating/verifying container "
+                f"'{container_name}'. This usually means a malformed storage account URL/connection string "
+                "(for example an invalid account name label)."
+            ) from exc
 
 
 def _process_one_file(plan: PlannedFile, config: AppConfig, clients: RuntimeClients) -> FileOutcome:
