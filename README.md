@@ -44,7 +44,7 @@ cp .env.example .env
 ### Required variables
 
 - `AZURE_CONTENT_UNDERSTANDING_ENDPOINT`
-- `ANALYZER_ID`
+- `ANALYZER_ID` (default: `uapGeneral`)
 - Blob storage auth:
   - either `AZURE_STORAGE_CONNECTION_STRING`
   - or `AZURE_STORAGE_ACCOUNT_URL` (with `DefaultAzureCredential` available)

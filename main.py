@@ -19,6 +19,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+if sys.version_info >= (3, 10):
+    from typing import TypeGuard
+else:  # Python 3.9: typing_extensions is installed as a dependency of azure-core
+    from typing_extensions import TypeGuard
+
 from azure.core.credentials import AzureKeyCredential
 from azure.core.exceptions import AzureError, ResourceExistsError
 from azure.identity import DefaultAzureCredential
@@ -50,7 +55,7 @@ class AppConfig:
 
     folder: Path
     endpoint: Optional[str]
-    analyzer_id: Optional[str]
+    analyzer_id: str
     api_version: str
     content_understanding_key: Optional[str]
     storage_connection_string: Optional[str]
@@ -98,7 +103,8 @@ def _normalize_env(value: Optional[str]) -> Optional[str]:
     return stripped if stripped else None
 
 
-def _is_real_secret(value: Optional[str]) -> bool:
+def _is_real_secret(value: Optional[str]) -> TypeGuard[str]:
+    """True if value is a non-empty, non-placeholder string (narrows the type to str)."""
     if value is None:
         return False
     normalized = value.strip()
@@ -189,7 +195,7 @@ def _create_parser() -> argparse.ArgumentParser:
 
 def _build_config(args: argparse.Namespace) -> AppConfig:
     endpoint = args.endpoint or os.getenv("AZURE_CONTENT_UNDERSTANDING_ENDPOINT")
-    analyzer_id = args.analyzer_id or os.getenv("ANALYZER_ID")
+    analyzer_id = args.analyzer_id or os.getenv("ANALYZER_ID") or "uapGeneral"
     api_version = args.api_version or os.getenv("API_VERSION", "2025-11-01")
 
     folder_raw = args.folder or os.getenv("INPUT_PDF_FOLDER")
