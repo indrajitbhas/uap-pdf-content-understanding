@@ -1,35 +1,38 @@
-# PDF Content Understanding CLI
+# PDF Content Understanding Workflow
 
-Production-ready Python CLI to batch-process PDF files with **Azure AI Content Understanding** and **Azure Blob Storage**.
+Production-ready Python CLI, built on **Microsoft Agent Framework workflows**, that analyzes PDFs
+already stored in **Azure Blob Storage** with **Azure AI Content Understanding** (document
+intelligence) and saves the analysis JSON back to Blob Storage.
 
-For each PDF found in a folder tree, the tool:
-1. Uploads the source PDF to Blob Storage.
-2. Sends the local PDF **bytes** to Content Understanding (`AnalysisInput(data=...)`) for analysis.
-3. Saves the analysis JSON:
-   - Locally next to the PDF as `<pdf_path>.json`.
-   - In Blob Storage as a `.json` blob with matching relative path.
+Source PDFs are expected to already be uploaded to a blob container (`PDFS_CONTAINER`, default
+`pdfs`). The tool no longer scans a local folder or uploads PDFs itself — it only reads from and
+writes to Blob Storage.
 
-> Scope note: this tool only analyzes PDFs and stores results. Azure AI Search indexing is intentionally out of scope.
+## Workflow graph
 
-## Features
+Built with [`agent-framework`](https://learn.microsoft.com/en-gb/agent-framework/get-started/workflows?pivots=programming-language-python)
+using `WorkflowBuilder`, `Executor` subclasses and the `@handler` decorator:
 
-- Recursive folder scan for `.pdf` files.
-- Skip already processed files when `<pdf>.json` exists (resume mode).
-- `--force` to re-analyze regardless of local JSON existence.
-- Parallel processing with `--workers`.
-- Per-file fault isolation (one failure does not stop the batch).
-- Final summary counters: analyzed, skipped, failed.
-- Config via `.env` + environment variables + CLI args (precedence documented below).
+```
+list_pdf_blobs  --> analyze_document  --> save_result
+```
+
+| Node | Type | Responsibility |
+|---|---|---|
+| `list_pdf_blobs` | start executor | Lists `*.pdf` blobs in `PDFS_CONTAINER`, skips ones whose result JSON already exists in `RESULTS_CONTAINER` (unless `--force`), and fans the rest out as `AnalyzeTask` messages. |
+| `analyze_document` | executor | Downloads the PDF bytes for a blob and runs the Azure AI Content Understanding analyzer (`ANALYZER_ID`) against the bytes, bounded by a concurrency semaphore. |
+| `save_result` | terminal executor | Uploads the analysis JSON to `RESULTS_CONTAINER` (default container: `pdf-results`) and yields a per-file `FileOutcome` as workflow output. |
+
+Each PDF flows through the graph independently, so failures are isolated per file. The CLI runs
+`workflow.run("start")` once and reads the aggregated `FileOutcome` list via `get_outputs()`.
 
 ## Installation
 
 ```bash
-cd /home/ubuntu/pdf_content_understanding
-python3 -m venv .venv
-source .venv/bin/activate
+cd uap-pdf-content-understanding
+python -m venv .venv
+.venv/Scripts/activate   # or `source .venv/bin/activate` on Linux/macOS
 pip install --upgrade pip
-pip install --pre azure-ai-contentunderstanding azure-identity azure-storage-blob python-dotenv
-# or
 pip install -r requirements.txt
 ```
 
@@ -48,16 +51,16 @@ cp .env.example .env
 - Blob storage auth:
   - either `AZURE_STORAGE_CONNECTION_STRING`
   - or `AZURE_STORAGE_ACCOUNT_URL` (with `DefaultAzureCredential` available)
-- `PDFS_CONTAINER`
-- `INPUT_PDF_FOLDER` (unless you pass `--folder`)
+- `PDFS_CONTAINER` (unless you pass `--pdfs-container`)
 
 ### Optional variables
 
 - `CONTENT_UNDERSTANDING_KEY` (if omitted/placeholder, tool uses `DefaultAzureCredential`)
 - `API_VERSION` (default: `2025-11-01`)
-- `RESULTS_CONTAINER` (default: same as `PDFS_CONTAINER`)
-- `RESULTS_PREFIX` (default behavior explained below)
-- `WORKERS` (default: `4`)
+- `PDFS_PREFIX` (optional virtual-folder prefix to scan within `PDFS_CONTAINER`)
+- `RESULTS_CONTAINER` (default: `pdf-results`)
+- `RESULTS_PREFIX` (optional prefix for JSON blobs inside `RESULTS_CONTAINER`)
+- `WORKERS` (max concurrent analyses, default: `4`)
 
 ## Authentication behavior
 
@@ -71,31 +74,19 @@ cp .env.example .env
 - If `AZURE_STORAGE_CONNECTION_STRING` is present and not a placeholder, it is used.
 - Otherwise the tool requires `AZURE_STORAGE_ACCOUNT_URL` and uses `DefaultAzureCredential`.
 
+Both Azure SDK clients are used in their `aio` (async) form so the workflow executors can run
+concurrently.
+
 ## Blob storage layout
 
-Relative paths are preserved from `--folder` / `INPUT_PDF_FOLDER`.
+Given a source blob `contracts/2026/sample.pdf` in `PDFS_CONTAINER`:
 
-Given PDF:
+- Analysis JSON is saved to:
+  - container: `RESULTS_CONTAINER` (default `pdf-results`)
+  - blob name: `<RESULTS_PREFIX>/contracts/2026/sample.json` when a prefix is set, otherwise
+    `contracts/2026/sample.json`
 
-`<root>/contracts/2026/sample.pdf`
-
-Uploads:
-
-- Source PDF blob:
-  - container: `PDFS_CONTAINER`
-  - blob name: `contracts/2026/sample.pdf`
-
-- Analysis JSON blob:
-  - container: `RESULTS_CONTAINER` (or same as PDF container if omitted)
-  - blob name:
-    - `<RESULTS_PREFIX>/contracts/2026/sample.json` when prefix is set
-    - `contracts/2026/sample.json` when prefix is empty
-
-Default prefix behavior:
-- If `RESULTS_CONTAINER` is omitted and reuses `PDFS_CONTAINER`, default prefix is `results`.
-- Otherwise default prefix is empty.
-
-The tool creates missing containers automatically (idempotent).
+Both containers (`PDFS_CONTAINER` and `RESULTS_CONTAINER`) are expected to already exist; the tool does not create them.
 
 ## CLI usage
 
@@ -105,9 +96,11 @@ python main.py --help
 
 ### Main options
 
-- `--folder`: root folder to scan recursively for PDFs.
-- `--force`: re-analyze even if `<pdf>.json` already exists.
-- `--workers`: number of parallel workers.
+- `--pdfs-container`: overrides `PDFS_CONTAINER`.
+- `--pdfs-prefix`: overrides `PDFS_PREFIX`.
+- `--results-container`: overrides `RESULTS_CONTAINER`.
+- `--force`: re-analyze even if a result blob already exists.
+- `--concurrency`: max PDFs analyzed concurrently (overrides `WORKERS`).
 - `--analyzer-id`: overrides `ANALYZER_ID`.
 - `--api-version`: overrides `API_VERSION`.
 - `--endpoint`: overrides `AZURE_CONTENT_UNDERSTANDING_ENDPOINT`.
@@ -126,26 +119,21 @@ Analyze using `.env` defaults:
 python main.py
 ```
 
-Analyze explicit folder with 8 workers:
+Analyze a specific container/prefix with higher concurrency:
 
 ```bash
-python main.py --folder /data/pdfs --workers 8
+python main.py --pdfs-container pdfs --pdfs-prefix contracts/2026 --concurrency 8
 ```
 
-Force re-analysis:
+Force re-analysis of everything:
 
 ```bash
-python main.py --folder /data/pdfs --force
+python main.py --force
 ```
 
 ## Output behavior
 
-For each `some/path/doc.pdf`:
-
-- Local JSON written to: `some/path/doc.pdf.json`
-- Blob JSON written with same relative structure and `.json` extension.
-
-At the end, a summary is printed:
+At the end of the run, a summary is printed:
 
 ```text
 Summary:
@@ -156,5 +144,7 @@ Summary:
 
 ## Notes
 
-- Local skip check is based solely on existence of `<pdf>.json`, allowing offline test of skip logic without Azure credentials.
-- SDK bytes input verified with `AnalysisInput(data=..., mime_type="application/pdf")` for the installed prerelease package.
+- The result-exists check (`<blob>.json` in `RESULTS_CONTAINER`) is what drives the skip/resume
+  behavior; use `--force` to bypass it.
+- SDK bytes input verified with `AnalysisInput(data=..., mime_type="application/pdf")` for the
+  installed prerelease `azure-ai-contentunderstanding` package.
