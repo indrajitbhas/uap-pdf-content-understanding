@@ -2,15 +2,18 @@
 """Blob-driven PDF analyzer built with Microsoft Agent Framework workflows.
 
 The source PDFs already live in an Azure Blob Storage container (``PDFS_CONTAINER``).
-This CLI wires three workflow nodes (executors) together with ``WorkflowBuilder``:
+This CLI wires four workflow nodes (executors) together with ``WorkflowBuilder``:
 
 1. ``list_pdf_blobs``   - lists the PDF blobs in the source container and fans the
                            ones that still need processing out to the next node.
 2. ``analyze_document``  - downloads each PDF's bytes and runs the Azure AI
                            Content Understanding (document intelligence) analyzer.
 3. ``save_result``       - saves the resulting analysis JSON to the results
-                           container (``pdf-results`` by default) and yields the
-                           per-file outcome as the workflow output.
+                           container (``pdf-results`` by default).
+4. ``user_review``       - scans the saved JSON for words with low confidence
+                           (< ``CONFIDENCE_THRESHOLD``, default 0.8), builds a
+                           review note referencing the PDF review app
+                           (``REVIEW_APP_URL``), and yields it as workflow output.
 
 See: https://learn.microsoft.com/en-gb/agent-framework/get-started/workflows
 """
@@ -71,6 +74,8 @@ class AppConfig:
     results_prefix: str
     concurrency: int
     force: bool
+    review_app_url: str
+    confidence_threshold: float
 
 
 @dataclass(frozen=True)
@@ -93,11 +98,22 @@ class AnalysisOutcome:
 
 @dataclass(frozen=True)
 class FileOutcome:
-    """Terminal, per-file workflow output used for the run summary."""
+    """Per-file result of the analysis/save stage, fed into the review node."""
 
     blob_name: str
     status: str
     elapsed_seconds: float
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class ReviewOutcome:
+    """Terminal, per-file review output used for the run summary."""
+
+    blob_name: str
+    status: str
+    low_confidence_count: int
+    review_text: str
     message: str = ""
 
 
@@ -123,6 +139,68 @@ def _result_blob_name(pdf_blob_name: str, prefix: str) -> str:
     json_name = f"{stem or pdf_blob_name}.json"
     cleaned_prefix = prefix.strip("/")
     return f"{cleaned_prefix}/{json_name}" if cleaned_prefix else json_name
+
+
+def _extract_low_confidence_words(
+    result_json: dict, threshold: float
+) -> list[tuple[int, str, float]]:
+    """Return (page_number, text, confidence) for every word below the threshold.
+
+    Handles the shapes the review app supports: bare ``{"pages": [...]}``,
+    ``{"kind": "document", "document": {"pages": [...]}}``, and the SDK
+    ``as_dict()`` output where pages live under ``contents[*].pages``.
+    """
+
+    low_words: list[tuple[int, str, float]] = []
+
+    def walk(obj: object, current_page: int) -> None:
+        if isinstance(obj, dict):
+            page_number = obj.get("pageNumber") or obj.get("page_number")
+            if isinstance(page_number, int):
+                current_page = page_number
+
+            words = obj.get("words")
+            if isinstance(words, list):
+                for word in words:
+                    if not isinstance(word, dict):
+                        continue
+                    confidence = word.get("confidence")
+                    if not isinstance(confidence, (int, float)):
+                        continue
+                    if confidence >= threshold:
+                        continue
+                    text = word.get("content") or word.get("text") or ""
+                    low_words.append((current_page, str(text), float(confidence)))
+
+            for value in obj.values():
+                walk(value, current_page)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item, current_page)
+
+    walk(result_json, 0)
+    low_words.sort(key=lambda item: (item[0], item[2]))
+    return low_words
+
+
+def _build_review_text(
+    blob_name: str,
+    low_words: list[tuple[int, str, float]],
+    threshold: float,
+    review_app_url: str,
+) -> str:
+    """Build the human-readable review note for one file."""
+    lines = [
+        f"Review requested for: {blob_name}",
+        f"Open in the review app: {review_app_url}",
+        f"{len(low_words)} word(s) with confidence < {threshold}:",
+    ]
+    for page_number, text, confidence in low_words[:100]:
+        snippet = repr(text[:60]) if text else "<empty>"
+        lines.append(f"  page {page_number}: {snippet} (confidence {confidence:.3f})")
+    if len(low_words) > 100:
+        lines.append(f"  ... and {len(low_words) - 100} more")
+    return "\n".join(lines)
 
 
 class ListPdfBlobsExecutor(Executor):
@@ -238,7 +316,7 @@ class AnalyzeDocumentExecutor(Executor):
 
 
 class SaveResultExecutor(Executor):
-    """Terminal node: saves the analysis JSON to the results container."""
+    """Saves the analysis JSON to the results container, then fans out review."""
 
     def __init__(self, id: str, blob_service_client: BlobServiceClient, config: AppConfig):
         super().__init__(id=id)
@@ -246,9 +324,9 @@ class SaveResultExecutor(Executor):
         self._config = config
 
     @handler
-    async def save(self, outcome: AnalysisOutcome, ctx: WorkflowContext[Never, FileOutcome]) -> None:
+    async def save(self, outcome: AnalysisOutcome, ctx: WorkflowContext[FileOutcome]) -> None:
         if outcome.status != "analyzed" or outcome.json_text is None:
-            await ctx.yield_output(
+            await ctx.send_message(
                 FileOutcome(
                     blob_name=outcome.blob_name,
                     status="failed",
@@ -268,17 +346,98 @@ class SaveResultExecutor(Executor):
                 content_settings=ContentSettings(content_type="application/json"),
             )
             LOGGER.info("Saved result: %s -> %s/%s", outcome.blob_name, self._config.results_container, result_blob_name)
-            await ctx.yield_output(
+            await ctx.send_message(
                 FileOutcome(blob_name=outcome.blob_name, status="analyzed", elapsed_seconds=outcome.elapsed_seconds)
             )
         except AzureError as exc:
             message = getattr(exc, "message", str(exc)) or str(exc)
             LOGGER.error("Failed to save result for %s: %s", outcome.blob_name, message)
-            await ctx.yield_output(
+            await ctx.send_message(
                 FileOutcome(
                     blob_name=outcome.blob_name,
                     status="failed",
                     elapsed_seconds=outcome.elapsed_seconds,
+                    message=message,
+                )
+            )
+
+
+class UserReviewExecutor(Executor):
+    """Terminal node: flags words with low confidence (< threshold) for review.
+
+    Re-reads the analysis JSON from the results container and asks the user to
+    review the low-confidence words using the review app (``REVIEW_APP_URL``).
+    """
+
+    def __init__(self, id: str, blob_service_client: BlobServiceClient, config: AppConfig):
+        super().__init__(id=id)
+        self._blob_service_client = blob_service_client
+        self._config = config
+
+    @handler
+    async def review(self, outcome: FileOutcome, ctx: WorkflowContext[Never, ReviewOutcome]) -> None:
+        if outcome.status != "analyzed":
+            await ctx.yield_output(
+                ReviewOutcome(
+                    blob_name=outcome.blob_name,
+                    status="failed",
+                    low_confidence_count=0,
+                    review_text="",
+                    message=outcome.message,
+                )
+            )
+            return
+
+        try:
+            result_blob_name = _result_blob_name(outcome.blob_name, self._config.results_prefix)
+            results_container = self._blob_service_client.get_container_client(self._config.results_container)
+            downloader = await results_container.download_blob(result_blob_name)
+            result_json = json.loads((await downloader.readall()).decode("utf-8"))
+
+            low_words = _extract_low_confidence_words(result_json, self._config.confidence_threshold)
+            if not low_words:
+                LOGGER.info("No low-confidence words in: %s", outcome.blob_name)
+                await ctx.yield_output(
+                    ReviewOutcome(
+                        blob_name=outcome.blob_name,
+                        status="ok",
+                        low_confidence_count=0,
+                        review_text=(
+                            f"No words below confidence threshold {self._config.confidence_threshold} "
+                            f"in {outcome.blob_name}."
+                        ),
+                    )
+                )
+                return
+
+            LOGGER.info(
+                "Review needed for %s: %d word(s) below confidence %s",
+                outcome.blob_name,
+                len(low_words),
+                self._config.confidence_threshold,
+            )
+            await ctx.yield_output(
+                ReviewOutcome(
+                    blob_name=outcome.blob_name,
+                    status="needs_review",
+                    low_confidence_count=len(low_words),
+                    review_text=_build_review_text(
+                        outcome.blob_name,
+                        low_words,
+                        self._config.confidence_threshold,
+                        self._config.review_app_url,
+                    ),
+                )
+            )
+        except (AzureError, json.JSONDecodeError) as exc:
+            message = getattr(exc, "message", str(exc)) or str(exc)
+            LOGGER.error("Failed to review %s: %s", outcome.blob_name, message)
+            await ctx.yield_output(
+                ReviewOutcome(
+                    blob_name=outcome.blob_name,
+                    status="failed",
+                    low_confidence_count=0,
+                    review_text="",
                     message=message,
                 )
             )
@@ -289,15 +448,17 @@ def build_workflow(
     cu_client: ContentUnderstandingClient,
     config: AppConfig,
 ) -> tuple[Workflow, ListPdfBlobsExecutor]:
-    """Build a fresh workflow graph: list_pdf_blobs -> analyze_document -> save_result."""
+    """Build a fresh workflow graph: list -> analyze -> save -> user_review."""
     list_pdf_blobs = ListPdfBlobsExecutor("list_pdf_blobs", blob_service_client, config)
     analyze_document = AnalyzeDocumentExecutor("analyze_document", blob_service_client, cu_client, config)
     save_result = SaveResultExecutor("save_result", blob_service_client, config)
+    user_review = UserReviewExecutor("user_review", blob_service_client, config)
 
     workflow = (
         WorkflowBuilder(start_executor=list_pdf_blobs)
         .add_edge(list_pdf_blobs, analyze_document)
         .add_edge(analyze_document, save_result)
+        .add_edge(save_result, user_review)
         .build()
     )
     return workflow, list_pdf_blobs
@@ -332,18 +493,24 @@ def _create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Re-analyze PDFs even when a result blob already exists.",
     )
-    parser.add_argument(
-        "--concurrency",
-        type=int,
-        default=None,
-        help="Maximum number of PDFs analyzed concurrently.",
-    )
+    parser.add_argument("--concurrency", type=int, default=None, help="Maximum number of PDFs analyzed concurrently.")
     parser.add_argument("--analyzer-id", default=None, help="Azure Content Understanding analyzer ID.")
     parser.add_argument("--api-version", default=None, help="Azure Content Understanding API version.")
     parser.add_argument(
         "--endpoint",
         default=None,
         help="Azure Content Understanding endpoint (https://...services.ai.azure.com/).",
+    )
+    parser.add_argument(
+        "--review-app-url",
+        default=None,
+        help="URL of the PDF review app the user opens to review low-confidence words.",
+    )
+    parser.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=None,
+        help="Words with confidence below this value are flagged for review (default 0.8).",
     )
     return parser
 
@@ -363,6 +530,16 @@ def _build_config(args: argparse.Namespace) -> AppConfig:
     if concurrency <= 0:
         raise ValueError("--concurrency must be >= 1")
 
+    review_app_url = args.review_app_url or os.getenv("REVIEW_APP_URL", "https://uap-pdf-review.azurewebsites.net/")
+
+    confidence_threshold = (
+        args.confidence_threshold
+        if args.confidence_threshold is not None
+        else float(os.getenv("CONFIDENCE_THRESHOLD", "0.8"))
+    )
+    if not 0 < confidence_threshold <= 1:
+        raise ValueError("--confidence-threshold must be in (0, 1]")
+
     return AppConfig(
         endpoint=endpoint,
         analyzer_id=analyzer_id,
@@ -376,6 +553,8 @@ def _build_config(args: argparse.Namespace) -> AppConfig:
         results_prefix=os.getenv("RESULTS_PREFIX", "").strip("/"),
         concurrency=concurrency,
         force=args.force,
+        review_app_url=review_app_url,
+        confidence_threshold=confidence_threshold,
     )
 
 
@@ -420,20 +599,28 @@ async def run(config: AppConfig) -> int:
     try:
         workflow, list_pdf_blobs = build_workflow(blob_service_client, cu_client, config)
         run_result = await workflow.run("start")
-        outcomes: list[FileOutcome] = run_result.get_outputs()
+        outcomes: list[ReviewOutcome] = run_result.get_outputs()
 
-        analyzed = sum(1 for o in outcomes if o.status == "analyzed")
-        failed = sum(1 for o in outcomes if o.status == "failed")
-        for outcome in outcomes:
-            if outcome.status == "failed":
-                LOGGER.error("Failed: %s - %s", outcome.blob_name, outcome.message)
+        needs_review = [o for o in outcomes if o.status == "needs_review"]
+        ok = [o for o in outcomes if o.status == "ok"]
+        failed = [o for o in outcomes if o.status == "failed"]
+        for outcome in failed:
+            LOGGER.error("Failed: %s - %s", outcome.blob_name, outcome.message)
 
         print("Summary:")
-        print(f"  analyzed: {analyzed}")
-        print(f"  skipped:  {list_pdf_blobs.skipped_count}")
-        print(f"  failed:   {failed}")
+        print(f"  needs review: {len(needs_review)}")
+        print(f"  ok:           {len(ok)}")
+        print(f"  skipped:      {list_pdf_blobs.skipped_count}")
+        print(f"  failed:       {len(failed)}")
 
-        return 1 if failed > 0 else 0
+        if needs_review:
+            print()
+            print(f"Review app: {config.review_app_url}")
+            for outcome in needs_review:
+                print()
+                print(outcome.review_text)
+
+        return 1 if failed else 0
     finally:
         await cu_client.close()
         await blob_service_client.close()

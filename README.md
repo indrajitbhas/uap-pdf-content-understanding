@@ -14,17 +14,27 @@ Built with [`agent-framework`](https://learn.microsoft.com/en-gb/agent-framework
 using `WorkflowBuilder`, `Executor` subclasses and the `@handler` decorator:
 
 ```
-list_pdf_blobs  --> analyze_document  --> save_result
+list_pdf_blobs  --> analyze_document  --> save_result  --> user_review
 ```
 
 | Node | Type | Responsibility |
 |---|---|---|
 | `list_pdf_blobs` | start executor | Lists `*.pdf` blobs in `PDFS_CONTAINER`, skips ones whose result JSON already exists in `RESULTS_CONTAINER` (unless `--force`), and fans the rest out as `AnalyzeTask` messages. |
 | `analyze_document` | executor | Downloads the PDF bytes for a blob and runs the Azure AI Content Understanding analyzer (`ANALYZER_ID`) against the bytes, bounded by a concurrency semaphore. |
-| `save_result` | terminal executor | Uploads the analysis JSON to `RESULTS_CONTAINER` (default container: `pdf-results`) and yields a per-file `FileOutcome` as workflow output. |
+| `save_result` | executor | Uploads the analysis JSON to `RESULTS_CONTAINER` (default container: `pdf-results`). |
+| `user_review` | terminal executor | Re-reads the saved JSON and flags every word with confidence `< CONFIDENCE_THRESHOLD` (default `0.8`), builds a review note pointing to the PDF review app (`REVIEW_APP_URL`) and yields it as workflow output. |
 
 Each PDF flows through the graph independently, so failures are isolated per file. The CLI runs
-`workflow.run("start")` once and reads the aggregated `FileOutcome` list via `get_outputs()`.
+`workflow.run("start")` once and reads the aggregated review outcomes via `get_outputs()`.
+
+## User review integration
+
+When the analysis of a file contains words with confidence `< CONFIDENCE_THRESHOLD`, the
+`user_review` node produces a review note that lists those words (page, text, confidence) and
+asks the user to review them in the [PDF review app](https://uap-pdf-review.azurewebsites.net/)
+([source](https://github.com/indrajitbhas/validationFromContentUnderstandingJSON)). The review
+app reads the same containers (`pdfs` / `pdf-results`) in cloud mode, so the PDF and its raw
+JSON are available there once this workflow has saved them.
 
 ## Installation
 
@@ -38,11 +48,9 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Copy `.env.example` to `.env` and edit values.
-
-```bash
-cp .env.example .env
-```
+Set the environment variables below in your shell or in a `.env` file next to `main.py`
+(`python-dotenv` loads it automatically at startup). Required variables can also be provided via
+CLI flags (see "CLI usage").
 
 ### Required variables
 
@@ -61,6 +69,8 @@ cp .env.example .env
 - `RESULTS_CONTAINER` (default: `pdf-results`)
 - `RESULTS_PREFIX` (optional prefix for JSON blobs inside `RESULTS_CONTAINER`)
 - `WORKERS` (max concurrent analyses, default: `4`)
+- `CONFIDENCE_THRESHOLD` (review words with confidence below this value, default: `0.8`)
+- `REVIEW_APP_URL` (URL of the PDF review app, default: `https://uap-pdf-review.azurewebsites.net/`)
 
 ## Authentication behavior
 
@@ -104,6 +114,8 @@ python main.py --help
 - `--analyzer-id`: overrides `ANALYZER_ID`.
 - `--api-version`: overrides `API_VERSION`.
 - `--endpoint`: overrides `AZURE_CONTENT_UNDERSTANDING_ENDPOINT`.
+- `--review-app-url`: overrides `REVIEW_APP_URL`.
+- `--confidence-threshold`: overrides `CONFIDENCE_THRESHOLD` (must be in `(0, 1]`).
 
 ### Precedence
 
@@ -137,10 +149,23 @@ At the end of the run, a summary is printed:
 
 ```text
 Summary:
-  analyzed: X
-  skipped:  Y
-  failed:   Z
+  needs review: X
+  ok:           Y
+  skipped:      Z
+  failed:       W
+
+Review app: https://uap-pdf-review.azurewebsites.net/
+
+Review requested for: sample.pdf
+Open in the review app: https://uap-pdf-review.azurewebsites.net/
+3 word(s) with confidence < 0.8:
+  page 1: 'qulity' (confidence 0.420)
+  page 1: 'review' (confidence 0.650)
+  page 2: 'BadWord!' (confidence 0.100)
 ```
+
+Files whose analysis contains words below the confidence threshold are listed with the PDF review
+app URL; open the app (which reads the same `pdf-results` / `pdfs` containers) to correct them.
 
 ## Notes
 
