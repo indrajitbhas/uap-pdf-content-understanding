@@ -3,3 +3,4 @@ azure-ai-contentunderstanding>=1.2.0b3
 azure-identity>=1.26.0
 azure-storage-blob>=12.31.0
 python-dotenv>=1.0.0
+httpx>=0.27.0
