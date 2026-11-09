@@ -15,20 +15,14 @@ This CLI wires four workflow nodes (executors) together with ``WorkflowBuilder``
                            review note referencing the PDF review app
                            (``REVIEW_APP_URL``), and yields it as workflow output.
 
-A sixth stage (``--slice-only``) runs as a separate workflow *after* HITL word
-review: ``list_curated_blobs`` scans the results container for ``*.curated.json``
-blobs written by the review app and ``slice_curated`` breaks each into
-per-communication files (``<stem>__pNN[-NN].curated.json``) saved back to the
-cloud. Grouping uses deterministic heuristics by default and can
-optionally be delegated to a low-cost LLM (``--slice-llm``).
-
-A seventh stage (``--enrich-only``) runs *after* slicing and *before* indexing:
-``list_slices`` fans the per-communication slices out to
-``extract_page_details`` (per-page details plus the document-level ``research``
-block, LLM or rules; one LLM call per slice), then
-``standardize_details`` normalizes acronyms, dates and place names at document
-level and assembles the ``research`` block, and ``save_enriched`` writes the enrichment back into the same curated
-slice blob (in place, marked with ``document.enrichedAt``).
+A second workflow (``--slice-only``) runs *after* HITL word review:
+``list_curated_blobs`` scans the results container for ``*.curated.json`` blobs
+written by the review app, ``slice_curated`` splits each into per-communication
+slices (LLM grouping, heuristics as fallback), ``standardize_text`` reviews and
+fixes the OCR text with an LLM (split words, extra spaces), and ``save_sliced``
+writes ``<stem>__pNN[-NN].curated.json`` to the sliced container
+(``SLICED_CONTAINER``, default ``pdf-curated-sliced``). Entity and research
+enrichment is left to the AI Search skillset at indexing time.
 
 See: https://learn.microsoft.com/en-gb/agent-framework/get-started/workflows
 """
@@ -44,6 +38,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 from agent_framework import Executor, Workflow, WorkflowBuilder, WorkflowContext, handler
@@ -57,18 +52,13 @@ from azure.ai.contentunderstanding.models import AnalysisInput, AnalysisResult
 from dotenv import load_dotenv
 from typing_extensions import Never
 
+from text_cleanup import DEFAULT_BASE_URL, llm_clean_pages
 from split_curated import (
     apply_groups,
     group_pages,
     is_already_sliced,
     parse_groups,
     slice_curated,
-)
-from enrich_slice import (
-    is_already_enriched,
-    enrich_slice_with_details,
-    extract_document_details,
-    build_llm_config_from_env,
 )
 
 
@@ -109,12 +99,8 @@ class AppConfig:
     slice_enabled: bool
     slice_groups_override: Optional[str]
     slice_dry_run: bool
-    slice_llm_enabled: bool
     slice_auto: bool
-    enrich_enabled: bool
-    enrich_dry_run: bool
-    enrich_auto: bool
-    enrich_llm_enabled: bool
+    sliced_container: str
 
 
 @dataclass(frozen=True)
@@ -174,40 +160,12 @@ class SliceOutcome:
 
 
 @dataclass(frozen=True)
-class EnrichTask:
-    """A curated slice blob that should be enriched for indexing."""
+class SlicedDoc:
+    """Slices built from one curated blob, passed between the slice nodes."""
 
-    slice_blob_name: str
-
-
-@dataclass(frozen=True)
-class ExtractionTask:
-    """Slice JSON plus the per-page details extracted from it."""
-
-    slice_blob_name: str
-    json_text: Optional[str]
-    page_details: list
-    llm_used: bool
-    message: str = ""
-    research_payloads: tuple = ()
-
-
-@dataclass(frozen=True)
-class EnrichedSlice:
-    """An enriched slice ready to be saved next to the curated blob."""
-
-    slice_blob_name: str
-    enriched_json_text: Optional[str]
-    message: str = ""
-
-
-@dataclass(frozen=True)
-class EnrichOutcome:
-    """Terminal, per-slice enrichment output used for the run summary."""
-
-    blob_name: str
-    status: str
-    message: str = ""
+    curated_blob_name: str
+    folder: str
+    slices: tuple
 
 
 def _normalize_env(value: Optional[str]) -> Optional[str]:
@@ -709,6 +667,11 @@ class ListCuratedBlobsExecutor(Executor):
     @handler
     async def list_curated(self, _trigger: str, ctx: WorkflowContext[SliceTask]) -> None:
         results_container = self._blob_service_client.get_container_client(self._config.results_container)
+        sliced_names: list[str] = []
+        if not self._config.force:
+            sliced_container = self._blob_service_client.get_container_client(self._config.sliced_container)
+            async for blob in sliced_container.list_blobs(name_starts_with=self._config.results_prefix or None):
+                sliced_names.append(blob.name)
         async for blob in results_container.list_blobs(name_starts_with=self._config.results_prefix or None):
             name = blob.name
             if not name.lower().endswith(".curated.json"):
@@ -716,6 +679,11 @@ class ListCuratedBlobsExecutor(Executor):
             if is_already_sliced(name) or ".bak" in name.lower():
                 self.skipped_count += 1
                 LOGGER.info("Skipping (already a slice or backup): %s", name)
+                continue
+            slice_prefix = name[: -len(".curated.json")] + "__p"
+            if any(existing.startswith(slice_prefix) for existing in sliced_names):
+                self.skipped_count += 1
+                LOGGER.info("Skipping (already sliced in %s; use --force): %s", self._config.sliced_container, name)
                 continue
             self.discovered_count += 1
             await ctx.send_message(SliceTask(curated_blob_name=name))
@@ -728,13 +696,12 @@ class ListCuratedBlobsExecutor(Executor):
 
 
 class SliceCuratedExecutor(Executor):
-    """Slices a curated JSON into per-communication files and saves each to the
-    results container (cloud), named with its page range.
+    """Decides the page groups of a curated JSON and builds one slice per group.
 
-    Groups consecutive pages via deterministic heuristics (see ``split_curated.py``)
-    or optionally via a low-cost LLM (e.g. ``gpt-4.1-nano``) when enabled.
-    Each group becomes ``<stem>__pNN[-NN].curated.json`` in the same virtual
-    folder as the original curated blob.
+    Grouping: explicit ``--slice-groups`` override, else a low-cost LLM
+    (``LLM_GROUPING_*``), else deterministic heuristics (see ``split_curated.py``).
+    Nothing is written here: the slices go on to ``standardize_text`` and then
+    ``save_sliced``.
     """
 
     def __init__(self, id: str, blob_service_client: BlobServiceClient, config: AppConfig):
@@ -743,7 +710,7 @@ class SliceCuratedExecutor(Executor):
         self._config = config
 
     @handler
-    async def slice_and_save(self, task: SliceTask, ctx: WorkflowContext[Never, SliceOutcome]) -> None:
+    async def slice_curated(self, task: SliceTask, ctx: WorkflowContext[SlicedDoc, SliceOutcome]) -> None:
         results_container = self._blob_service_client.get_container_client(self._config.results_container)
         try:
             downloader = await results_container.download_blob(task.curated_blob_name)
@@ -760,16 +727,16 @@ class SliceCuratedExecutor(Executor):
                 )
                 return
 
-            # Grouping: explicit override > LLM > deterministic heuristics.
             groups: list[list[dict]]
             if self._config.slice_groups_override:
                 groups = apply_groups(pages, parse_groups(self._config.slice_groups_override))
-            elif self._config.slice_llm_enabled:
-                spec = _llm_group_spec(
+            else:
+                spec = await asyncio.to_thread(
+                    _llm_group_spec,
                     pages,
-                    model=os.getenv("LLM_GROUPING_MODEL", "gpt-4.1-nano"),
-                    base_url=os.getenv("LLM_GROUPING_BASE_URL") or "https://api.openai.com/v1",
-                    api_key=os.getenv("LLM_GROUPING_API_KEY"),
+                    os.getenv("LLM_GROUPING_MODEL", "gpt-4.1-nano"),
+                    os.getenv("LLM_GROUPING_BASE_URL") or DEFAULT_BASE_URL,
+                    os.getenv("LLM_GROUPING_API_KEY"),
                 )
                 if spec:
                     LOGGER.info("LLM grouping for %s: %s", task.curated_blob_name, spec)
@@ -780,169 +747,32 @@ class SliceCuratedExecutor(Executor):
                         groups = group_pages(pages)
                 else:
                     groups = group_pages(pages)
-            else:
-                groups = group_pages(pages)
 
             slash = task.curated_blob_name.rfind("/")
             folder = task.curated_blob_name[: slash + 1] if slash >= 0 else ""
             bare = task.curated_blob_name[slash + 1:] if slash >= 0 else task.curated_blob_name
             stem = bare[: -len(".curated.json")] if bare.lower().endswith(".curated.json") else bare
 
-            slices = slice_curated(
-                curated,
-                groups,
-                stem=stem,
-                source_file_name=task.curated_blob_name,
+            slices = slice_curated(curated, groups, stem=stem, source_file_name=task.curated_blob_name)
+            await ctx.send_message(
+                SlicedDoc(curated_blob_name=task.curated_blob_name, folder=folder, slices=tuple(slices))
             )
-
-            if self._config.slice_dry_run:
-                LOGGER.info("DRY RUN: would write %d slice(s) for %s", len(slices), task.curated_blob_name)
-            else:
-                for name, data in slices:
-                    target = f"{folder}{name}"
-                    await results_container.upload_blob(
-                        name=target,
-                        data=json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
-                        overwrite=True,
-                        content_settings=ContentSettings(content_type="application/json"),
-                    )
-                    LOGGER.info("Saved slice: %s/%s -> %s", self._config.results_container, target, len(data["pages"]))
-
-            await ctx.yield_output(
-                SliceOutcome(
-                    blob_name=task.curated_blob_name,
-                    status="ok",
-                    slice_count=len(slices),
-                )
-            )
-        except (AzureError, json.JSONDecodeError) as exc:
+        except (AzureError, json.JSONDecodeError, ValueError) as exc:
             message = getattr(exc, "message", str(exc)) or str(exc)
             LOGGER.error("Failed to slice %s: %s", task.curated_blob_name, message)
             await ctx.yield_output(
-                SliceOutcome(
-                    blob_name=task.curated_blob_name,
-                    status="failed",
-                    slice_count=0,
-                    message=message,
-                )
+                SliceOutcome(blob_name=task.curated_blob_name, status="failed", slice_count=0, message=message)
             )
 
 
-class ListSlicesExecutor(Executor):
-    """Start node for the enrich stage: fans out curated slices to enrich.
+class StandardizeTextExecutor(Executor):
+    """Reviews and fixes the OCR text of every page in the slices with an LLM.
 
-    Scans the results container for per-communication slices
-    (``<stem>__pNN[-NN].curated.json``) and skips the ones that already carry
-    in-place enrichment (``document.enrichedAt`` marker) unless ``--force``.
-    """
-
-    def __init__(self, id: str, blob_service_client: BlobServiceClient, config: AppConfig):
-        super().__init__(id=id)
-        self._blob_service_client = blob_service_client
-        self._config = config
-        self.discovered_count = 0
-        self.skipped_count = 0
-
-    @handler
-    async def list_slices(self, _trigger: str, ctx: WorkflowContext[EnrichTask]) -> None:
-        results_container = self._blob_service_client.get_container_client(self._config.results_container)
-        async for blob in results_container.list_blobs(name_starts_with=self._config.results_prefix or None):
-            name = blob.name
-            if not name.lower().endswith(".curated.json"):
-                continue
-            if not is_already_sliced(name) or ".bak" in name.lower():
-                continue
-            if not self._config.force:
-                already_enriched = False
-                try:
-                    downloader = await results_container.download_blob(name)
-                    data = json.loads((await downloader.readall()).decode("utf-8"))
-                    already_enriched = is_already_enriched(data)
-                except (AzureError, json.JSONDecodeError) as exc:
-                    LOGGER.error(
-                        "Enrich stage: cannot read %s (%s); will (re)enrich",
-                        name,
-                        getattr(exc, "message", str(exc)) or str(exc),
-                    )
-                if already_enriched:
-                    self.skipped_count += 1
-                    LOGGER.info("Enrich stage: skipping (already enriched): %s", name)
-                    continue
-            self.discovered_count += 1
-            await ctx.send_message(EnrichTask(slice_blob_name=name))
-
-        LOGGER.info(
-            "Enrich stage: discovered %d slice(s), skipped %d",
-            self.discovered_count,
-            self.skipped_count,
-        )
-
-
-class ExtractDetailsExecutor(Executor):
-    """First enrichment node: per-page detail extraction.
-
-    Downloads a curated slice and extracts suitable details from each page
-    (docType, date, from/to, subject, classification, persons, organizations,
-    units, acronyms, dates, places, summary) — via the LLM (batched, when
-    enabled and configured) or deterministic rule-based heuristics. A message
-    carrying the slice JSON plus one detail dict per page is sent downstream.
-    """
-
-    def __init__(self, id: str, blob_service_client: BlobServiceClient, config: AppConfig):
-        super().__init__(id=id)
-        self._blob_service_client = blob_service_client
-        self._config = config
-        self._semaphore = asyncio.Semaphore(config.concurrency)
-        self._llm_config = build_llm_config_from_env()
-
-    @handler
-    async def extract_details(self, task: EnrichTask, ctx: WorkflowContext[ExtractionTask]) -> None:
-        async with self._semaphore:
-            try:
-                results_container = self._blob_service_client.get_container_client(self._config.results_container)
-                downloader = await results_container.download_blob(task.slice_blob_name)
-                json_text = (await downloader.readall()).decode("utf-8")
-                data = json.loads(json_text)
-                pages = data.get("pages") or []
-
-                cfg = self._llm_config if self._config.enrich_llm_enabled else None
-                page_details, research_payloads, llm_used = extract_document_details(pages, cfg)
-                LOGGER.info(
-                    "Enrich: extracted details for %s (%d page(s), %s)",
-                    task.slice_blob_name,
-                    len(pages),
-                    "llm" if llm_used else "rules",
-                )
-                await ctx.send_message(
-                    ExtractionTask(
-                        slice_blob_name=task.slice_blob_name,
-                        json_text=json_text,
-                        page_details=page_details,
-                        llm_used=llm_used,
-                        research_payloads=tuple(research_payloads),
-                    )
-                )
-            except (AzureError, json.JSONDecodeError) as exc:
-                message = getattr(exc, "message", str(exc)) or str(exc)
-                LOGGER.error("Failed to extract details for %s: %s", task.slice_blob_name, message)
-                await ctx.send_message(
-                    ExtractionTask(
-                        slice_blob_name=task.slice_blob_name,
-                        json_text=None,
-                        page_details=[],
-                        llm_used=False,
-                        message=message,
-                    )
-                )
-
-
-class StandardizeDetailsExecutor(Executor):
-    """Second enrichment node: document-level standardization.
-
-    Builds the first-occurrence acronym glossary, normalizes dates to ISO 8601
-    and maps place names to canonical forms, then adds a per-page
-    ``enrichment`` block and ``standardText`` (acronyms expanded on first
-    occurrence) to a copy of the curated slice.
+    Re-joins words split by hyphens or stray characters, removes extra spaces and
+    spacing around punctuation, and fixes OCR letter errors. A page's text is only
+    replaced when its digits are unchanged and its letters are at least 97% similar
+    (see ``text_cleanup.py``). Pages are processed in batches across all slices of one
+    curated file.
     """
 
     def __init__(self, id: str, config: AppConfig):
@@ -950,45 +780,37 @@ class StandardizeDetailsExecutor(Executor):
         self._config = config
 
     @handler
-    async def standardize(self, task: ExtractionTask, ctx: WorkflowContext[EnrichedSlice]) -> None:
-        if task.json_text is None:
-            await ctx.send_message(
-                EnrichedSlice(
-                    slice_blob_name=task.slice_blob_name,
-                    enriched_json_text=None,
-                    message=task.message,
-                )
-            )
-            return
+    async def standardize(self, doc: SlicedDoc, ctx: WorkflowContext[SlicedDoc]) -> None:
         try:
-            data = json.loads(task.json_text)
-            enriched = enrich_slice_with_details(
-                data, task.page_details, task.llm_used, list(task.research_payloads)
-            )
-            await ctx.send_message(
-                EnrichedSlice(
-                    slice_blob_name=task.slice_blob_name,
-                    enriched_json_text=json.dumps(enriched, ensure_ascii=False, indent=2),
-                )
-            )
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.exception("Failed to standardize %s", task.slice_blob_name)
-            await ctx.send_message(
-                EnrichedSlice(
-                    slice_blob_name=task.slice_blob_name,
-                    enriched_json_text=None,
-                    message=str(exc),
-                )
-            )
+            batch_size = int(os.getenv("LLM_GROUPING_BATCH", "10"))
+        except (TypeError, ValueError):
+            batch_size = 10
+        flat = [page for _, data in doc.slices for page in data["pages"]]
+        cleaned = await asyncio.to_thread(
+            llm_clean_pages,
+            flat,
+            model=os.getenv("CLEANUP_MODEL") or os.getenv("LLM_GROUPING_MODEL", "gpt-4.1-nano"),
+            base_url=os.getenv("LLM_GROUPING_BASE_URL") or DEFAULT_BASE_URL,
+            api_key=os.getenv("LLM_GROUPING_API_KEY"),
+            batch_size=batch_size if batch_size > 0 else 10,
+            delay=float(os.getenv("LLM_GROUPING_DELAY", "75")),
+        )
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        out = []
+        cursor = 0
+        for name, data in doc.slices:
+            count = len(data["pages"])
+            new_data = dict(data)
+            new_data["pages"] = cleaned[cursor : cursor + count]
+            new_data["document"] = {**data["document"], "textStandardizedAt": stamp}
+            cursor += count
+            out.append((name, new_data))
+        LOGGER.info("Standardized text: %s (%d slice(s), %d page(s))", doc.curated_blob_name, len(out), len(flat))
+        await ctx.send_message(SlicedDoc(curated_blob_name=doc.curated_blob_name, folder=doc.folder, slices=tuple(out)))
 
 
-class SaveEnrichedExecutor(Executor):
-    """Terminal enrichment node: writes the enrichment back into the slice.
-
-    The enriched JSON (per-page ``enrichment``/``standardText`` plus the
-    document-level ``normalized`` block) is uploaded **in place**, overwriting
-    the same curated slice blob (or simply logged, with ``--enrich-dry-run``).
-    """
+class SaveSlicedExecutor(Executor):
+    """Terminal node: uploads the finished slices to the sliced container."""
 
     def __init__(self, id: str, blob_service_client: BlobServiceClient, config: AppConfig):
         super().__init__(id=id)
@@ -996,48 +818,29 @@ class SaveEnrichedExecutor(Executor):
         self._config = config
 
     @handler
-    async def save_enriched(self, task: EnrichedSlice, ctx: WorkflowContext[Never, EnrichOutcome]) -> None:
-        if task.enriched_json_text is None:
-            await ctx.yield_output(
-                EnrichOutcome(
-                    blob_name=task.slice_blob_name,
-                    status="failed",
-                    message=task.message,
-                )
-            )
-            return
-
+    async def save_sliced(self, doc: SlicedDoc, ctx: WorkflowContext[Never, SliceOutcome]) -> None:
         try:
-            if self._config.enrich_dry_run:
-                LOGGER.info("Enrich DRY RUN: would write %s", task.slice_blob_name)
+            if self._config.slice_dry_run:
+                LOGGER.info("DRY RUN: would write %d slice(s) for %s", len(doc.slices), doc.curated_blob_name)
             else:
-                results_container = self._blob_service_client.get_container_client(self._config.results_container)
-                await results_container.upload_blob(
-                    name=task.slice_blob_name,
-                    data=task.enriched_json_text.encode("utf-8"),
-                    overwrite=True,
-                    content_settings=ContentSettings(content_type="application/json"),
-                )
-                LOGGER.info(
-                    "Saved enriched (in place): %s/%s",
-                    self._config.results_container,
-                    task.slice_blob_name,
-                )
+                container = self._blob_service_client.get_container_client(self._config.sliced_container)
+                for name, data in doc.slices:
+                    target = f"{doc.folder}{name}"
+                    await container.upload_blob(
+                        name=target,
+                        data=json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+                        overwrite=True,
+                        content_settings=ContentSettings(content_type="application/json"),
+                    )
+                    LOGGER.info("Saved slice: %s/%s (%d page(s))", self._config.sliced_container, target, len(data["pages"]))
             await ctx.yield_output(
-                EnrichOutcome(
-                    blob_name=task.slice_blob_name,
-                    status="ok",
-                )
+                SliceOutcome(blob_name=doc.curated_blob_name, status="ok", slice_count=len(doc.slices))
             )
         except AzureError as exc:
             message = getattr(exc, "message", str(exc)) or str(exc)
-            LOGGER.error("Failed to save enriched for %s: %s", task.slice_blob_name, message)
+            LOGGER.error("Failed to save slices for %s: %s", doc.curated_blob_name, message)
             await ctx.yield_output(
-                EnrichOutcome(
-                    blob_name=task.slice_blob_name,
-                    status="failed",
-                    message=message,
-                )
+                SliceOutcome(blob_name=doc.curated_blob_name, status="failed", slice_count=0, message=message)
             )
 
 
@@ -1066,45 +869,23 @@ def build_slice_workflow(
     blob_service_client: BlobServiceClient,
     config: AppConfig,
 ) -> tuple[Workflow, ListCuratedBlobsExecutor]:
-    """Build a workflow for the post-HITL slice stage: curated JSONs -> slices.
+    """Build the post-HITL slice workflow: curated JSONs -> cleaned slices in the sliced container.
 
-    Graph: list_curated_blobs -> slice_curated (each slice saved to the cloud).
+    Graph: list_curated_blobs -> slice_curated -> standardize_text -> save_sliced.
     """
     list_curated = ListCuratedBlobsExecutor("list_curated_blobs", blob_service_client, config)
     slice_curated_node = SliceCuratedExecutor("slice_curated", blob_service_client, config)
+    standardize_text = StandardizeTextExecutor("standardize_text", config)
+    save_sliced = SaveSlicedExecutor("save_sliced", blob_service_client, config)
 
     workflow = (
         WorkflowBuilder(start_executor=list_curated)
         .add_edge(list_curated, slice_curated_node)
+        .add_edge(slice_curated_node, standardize_text)
+        .add_edge(standardize_text, save_sliced)
         .build()
     )
     return workflow, list_curated
-
-
-def build_enrich_workflow(
-    blob_service_client: BlobServiceClient,
-    config: AppConfig,
-) -> tuple[Workflow, ListSlicesExecutor]:
-    """Build the post-slice enrichment workflow used before indexing.
-
-    Graph: list_slices -> extract_page_details -> standardize_details ->
-    save_enriched. Extraction is per page (LLM or rules), standardization is
-    document-level (acronyms, dates, place names); the enriched slice is
-    written back over the same curated blob, in place.
-    """
-    list_slices = ListSlicesExecutor("list_slices", blob_service_client, config)
-    extract_details = ExtractDetailsExecutor("extract_page_details", blob_service_client, config)
-    standardize_details = StandardizeDetailsExecutor("standardize_details", config)
-    save_enriched = SaveEnrichedExecutor("save_enriched", blob_service_client, config)
-
-    workflow = (
-        WorkflowBuilder(start_executor=list_slices)
-        .add_edge(list_slices, extract_details)
-        .add_edge(extract_details, standardize_details)
-        .add_edge(standardize_details, save_enriched)
-        .build()
-    )
-    return workflow, list_slices
 
 
 def _create_parser() -> argparse.ArgumentParser:
@@ -1134,7 +915,8 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-analyze PDFs even when a result blob already exists.",
+        help="Re-analyze PDFs even when a result blob already exists, and re-slice curated "
+        "files that already have slices in the sliced container.",
     )
     parser.add_argument("--concurrency", type=int, default=None, help="Maximum number of PDFs analyzed concurrently.")
     parser.add_argument("--analyzer-id", default=None, help="Azure Content Understanding analyzer ID.")
@@ -1159,7 +941,7 @@ def _create_parser() -> argparse.ArgumentParser:
         "--slice-only",
         action="store_true",
         help="Run only the post-HITL slice stage: slice every existing *.curated.json "
-        "blob into per-communication files and save them to the cloud.",
+        "blob into per-communication files, fix their text and save them to the sliced container.",
     )
     parser.add_argument(
         "--slice-groups",
@@ -1174,9 +956,7 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--slice-llm",
         action="store_true",
-        help="In slice mode: use a low-cost LLM (default gpt-4.1-nano) for page grouping "
-        "instead of deterministic heuristics. Requires LLM_GROUPING_API_KEY "
-        "(OpenAI-compatible).",
+        help="Deprecated no-op: slicing always uses the LLM for page grouping.",
     )
     parser.add_argument(
         "--slice-auto",
@@ -1187,34 +967,9 @@ def _create_parser() -> argparse.ArgumentParser:
         "for the --slice-only run after the human reviews them.",
     )
     parser.add_argument(
-        "--enrich-only",
-        action="store_true",
-        help="Run only the enrichment stage: enrich every existing per-communication "
-        "slice (<stem>__pNN[-NN].curated.json) in place, adding per-page "
-        "enrichment/standardText and document-level normalized details "
-        "(acronyms, dates, places). Already-enriched slices are skipped "
-        "unless --force.",
-    )
-    parser.add_argument(
-        "--enrich-dry-run",
-        action="store_true",
-        help="In enrich mode: compute enrichment without uploading anything.",
-    )
-    parser.add_argument(
-        "--enrich-llm",
-        action="store_true",
-        help="In enrich mode: use the LLM (ENRICH_MODEL, default gpt-4.1-nano) for "
-        "per-page details and the research block (one call per slice) instead of "
-        "deterministic heuristics. Requires "
-        "ENRICH_API_KEY (OpenAI-compatible) or an AI Foundry endpoint "
-        "(DefaultAzureCredential).",
-    )
-    parser.add_argument(
-        "--enrich-auto",
-        action="store_true",
-        help="After the slice stage, also run the enrichment stage in the same "
-        "invocation for the slices that exist (--slice-only --enrich-auto, or with "
-        "--slice-auto after analyze).",
+        "--sliced-container",
+        default=None,
+        help="Container for the finished slices. Falls back to SLICED_CONTAINER (default: pdf-curated-sliced).",
     )
     return parser
 
@@ -1229,6 +984,7 @@ def _build_config(args: argparse.Namespace) -> AppConfig:
         raise ValueError("Missing PDFS_CONTAINER in environment/.env (or pass --pdfs-container).")
 
     results_container = args.results_container or os.getenv("RESULTS_CONTAINER", "pdf-results")
+    sliced_container = args.sliced_container or os.getenv("SLICED_CONTAINER", "pdf-curated-sliced")
 
     concurrency = args.concurrency if args.concurrency is not None else int(os.getenv("WORKERS", "4"))
     if concurrency <= 0:
@@ -1262,12 +1018,8 @@ def _build_config(args: argparse.Namespace) -> AppConfig:
         slice_enabled=args.slice_only,
         slice_groups_override=args.slice_groups,
         slice_dry_run=args.slice_dry_run,
-        slice_llm_enabled=args.slice_llm,
         slice_auto=args.slice_auto,
-        enrich_enabled=args.enrich_only,
-        enrich_dry_run=args.enrich_dry_run,
-        enrich_auto=args.enrich_auto,
-        enrich_llm_enabled=args.enrich_llm,
+        sliced_container=sliced_container,
     )
 
 
@@ -1322,6 +1074,7 @@ async def _run_slice_stage(blob_service_client: BlobServiceClient, config: AppCo
     print(f"  skipped:  {len(skipped) + list_curated.skipped_count}")
     print(f"  failed:   {len(failed)}")
     print(f"  dry-run:  {'yes' if config.slice_dry_run else 'no'}")
+    print(f"  target:   {config.sliced_container}")
 
     for outcome in ok_slices:
         print(f"  - {outcome.blob_name}: {outcome.slice_count} slice(s)")
@@ -1329,43 +1082,12 @@ async def _run_slice_stage(blob_service_client: BlobServiceClient, config: AppCo
     return 1 if failed else 0
 
 
-async def _run_enrich_stage(blob_service_client: BlobServiceClient, config: AppConfig) -> int:
-    """Run the enrichment stage: curated slices -> per-slice enriched JSON."""
-    enrich_workflow, list_slices = build_enrich_workflow(blob_service_client, config)
-    enrich_result = await enrich_workflow.run("start")
-    outcomes: list[EnrichOutcome] = enrich_result.get_outputs()
-
-    ok_enrich = [o for o in outcomes if o.status == "ok"]
-    failed = [o for o in outcomes if o.status == "failed"]
-    for outcome in failed:
-        LOGGER.error("Failed to enrich: %s - %s", outcome.blob_name, outcome.message)
-
-    print("Enrichment summary:")
-    print(f"  enriched:   {len(ok_enrich)}")
-    print(f"  skipped:    {list_slices.skipped_count}")
-    print(f"  failed:     {len(failed)}")
-    print(f"  dry-run:    {'yes' if config.enrich_dry_run else 'no'}")
-    print(f"  extraction: {'llm' if config.enrich_llm_enabled else 'rules'}")
-
-    for outcome in ok_enrich:
-        print(f"  - {outcome.blob_name} (enriched in place)")
-
-    return 1 if failed else 0
-
-
 async def run(config: AppConfig) -> int:
     blob_service_client = _build_blob_service_client(config)
 
-    if config.slice_enabled or config.enrich_enabled:
-        cu_client = None
+    if config.slice_enabled:
         try:
-            slice_rc = 0
-            if config.slice_enabled:
-                slice_rc = await _run_slice_stage(blob_service_client, config)
-            enrich_rc = 0
-            if config.enrich_enabled or config.enrich_auto:
-                enrich_rc = await _run_enrich_stage(blob_service_client, config)
-            return 1 if (slice_rc or enrich_rc) else 0
+            return await _run_slice_stage(blob_service_client, config)
         finally:
             await blob_service_client.close()
 
@@ -1399,11 +1121,6 @@ async def run(config: AppConfig) -> int:
             print()
             print("=== Auto-continuing to slice stage (files already reviewed) ===")
             slice_rc = await _run_slice_stage(blob_service_client, config)
-            if config.enrich_auto:
-                print()
-                print("=== Auto-continuing to enrich stage ===")
-                enrich_rc = await _run_enrich_stage(blob_service_client, config)
-                return 1 if (failed or slice_rc or enrich_rc) else 0
             return 1 if (failed or slice_rc) else 0
 
         return 1 if failed else 0

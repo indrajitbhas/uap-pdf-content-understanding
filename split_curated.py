@@ -153,7 +153,7 @@ def slice_curated(
     stem: str,
     source_file_name: Optional[str] = None,
 ) -> list[tuple[str, dict]]:
-    """Build one (file_name, curated_dict) per group, preserving full schema."""
+    """Build one (file_name, curated_dict) per group, dropping per-page ``words``."""
     document = dict(curated.get("document") or {})
     document["sourceCurated"] = source_file_name or document.get("fileName", "unknown.curated.json")
 
@@ -170,7 +170,7 @@ def slice_curated(
                 {
                     "schema": curated.get("schema", "curated/1"),
                     "document": doc_copy,
-                    "pages": list(group),
+                    "pages": [{k: v for k, v in p.items() if k != "words"} for p in group if isinstance(p, dict)],
                 },
             )
         )
