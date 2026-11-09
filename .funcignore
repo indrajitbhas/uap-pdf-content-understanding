@@ -1,0 +1,16 @@
+.git*
+.vscode
+.env
+.env.*
+pdfs/
+*.log
+main.py
+split_curated.py
+text_cleanup.py
+README.md
+__azurite_db*__.json
+__blobstorage__
+__queuestorage__
+local.settings.json
+test
+.venv
