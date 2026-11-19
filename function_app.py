@@ -3,6 +3,8 @@ import logging
 import re
 import azure.functions as func
 
+from enrichment import extract_tier1
+
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 # Fallback: strip "__p01-02.curated.json" from the curated file name
@@ -43,14 +45,24 @@ def combine(req: func.HttpRequest) -> func.HttpResponse:
             if not nums:
                 warnings.append({"message": "No pages found"})
 
+            content_text = "\n\n".join(t for t in texts if t)
+            result = {
+                "contentText": content_text,
+                "pageFrom": min(nums) if nums else None,
+                "pageTo": max(nums) if nums else None,
+                "sourcePdfName": pdf_name,
+            }
+            # Tier 1 enrichment (regex/string only, never raises)
+            result.update(extract_tier1(
+                content_text,
+                file_name=data.get("fileName"),
+                source_json=data.get("sourceJson"),
+                warnings=warnings,
+            ))
+
             results.append({
                 "recordId": record_id,
-                "data": {
-                    "contentText": "\n\n".join(t for t in texts if t),
-                    "pageFrom": min(nums) if nums else None,
-                    "pageTo": max(nums) if nums else None,
-                    "sourcePdfName": pdf_name,
-                },
+                "data": result,
                 "errors": [],
                 "warnings": warnings,
             })
