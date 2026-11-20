@@ -5,6 +5,8 @@ directly. Every public extractor returns None when nothing is found and never
 raises for missing/odd input.
 """
 import re
+from collections import Counter
+from difflib import SequenceMatcher
 
 # ---------------------------------------------------------------------------
 # Filename: "18_100754_ General 1946-7_Vol_2__p01-02.curated.json"
@@ -61,10 +63,33 @@ CLASSIFICATION_ORDER = ["TOP SECRET", "SECRET", "CONFIDENTIAL", "RESTRICTED", "U
 CLASSIFICATION_RE = re.compile(r"\b(TOP\s+SECRET|SECRET|CONFIDENTIAL|RESTRICTED|UNCLASSIFIED)\b")
 
 
+# OCR often garbles the stamp ("CONCENTIAL", "SECONET", "RESTRICTD"). Uppercase
+# tokens close enough to a marking count as that marking.
+_FUZZY_TARGETS = ("CONFIDENTIAL", "RESTRICTED", "SECRET")
+_FUZZY_TOKEN_RE = re.compile(r"\b[A-Z]{5,13}\b")
+_FUZZY_EXCLUDE = {"SECRETARY", "SECRETARIAT", "SECRETS", "RESTRICTION", "RESTRICTIONS", "CONFIDENCE",
+                  "DECLASSIFIED", "UNCLASSIFIED", "CORRECTED", "DIRECTED", "SELECTED", "REJECTED",
+                  "CONTINENTAL", "CONTINENT", "COINCIDENTAL", "CONSEQUENTIAL", "CREDENTIAL",
+                  "RESIDENTIAL", "PRESIDENTIAL", "CONFIDENT", "SECRETLY", "RESTRICTS"}
+
+
+def _fuzzy_markings(text):
+    found = set()
+    for tok in set(_FUZZY_TOKEN_RE.findall(text)):
+        if tok in _FUZZY_EXCLUDE or tok in _FUZZY_TARGETS:
+            continue
+        for target in _FUZZY_TARGETS:
+            if abs(len(tok) - len(target)) <= 2 and tok[0] == target[0] \
+                    and SequenceMatcher(None, tok, target).ratio() >= 0.75:
+                found.add(target)
+    return found
+
+
 def extract_classification_level(text):
     if not text:
         return None
     found = {re.sub(r"\s+", " ", m.group(1)) for m in CLASSIFICATION_RE.finditer(text)}
+    found |= _fuzzy_markings(text)
     for level in CLASSIFICATION_ORDER:
         if level in found:
             return level
@@ -83,9 +108,18 @@ DOC_TYPE_SIGNALS = {
                r"\b(?:Sincerely|Very truly yours|Respectfully yours)\b"],
     "Report": [r"\bREPORT\s+(?:NO|NUMBER|OF)\b", r"\b(?:INTELLIGENCE|TECHNICAL|INCIDENT|SIGHTING)\s+REPORT\b",
                r"\bSUMMARY\s+OF\b", r"\bINCIDENT\s+(?:NO|NUMBER)\b", r"\bFINDINGS\b"],
-    "Form": [r"\bFORM\s+NO\b", r"\bFORM\s+\d", r"\bFORM\s*#"],
+    "Form": [r"\bF?ORM\s+NO\b", r"\bFORM\s+\d", r"\bFORM\s*#"],
 }
+# Self-describing titles outweigh generic header labels (TO:/FROM:/SUBJECT:),
+# which also appear on memos and forms.
+STRONG_DOC_TYPE_SIGNALS = {
+    "Telegram": [r"\bTELEGRAM\b", r"\bTELETYPE\b", r"\bCABLEGRAM\b", r"\bRADIOGRAM\b"],
+    "Memo": [r"\bMEMORANDUM\b", r"\bROUTING AND RECORD\b"],
+    "Form": [r"\bREFERENCE FORM\b", r"\bROUTING SLIP\b", r"\bDISPOSITION FORM\b", r"\bRECORD CARD\b"],
+}
+STRONG_WEIGHT = 3
 _DOC_TYPE_PATTERNS = {k: [re.compile(p, re.IGNORECASE) for p in v] for k, v in DOC_TYPE_SIGNALS.items()}
+_STRONG_PATTERNS = {k: [re.compile(p, re.IGNORECASE) for p in v] for k, v in STRONG_DOC_TYPE_SIGNALS.items()}
 # Tie-break priority (earlier wins on equal score).
 DOC_TYPE_PRIORITY = ["Telegram", "Memo", "Letter", "Report", "Form"]
 
@@ -94,17 +128,21 @@ def extract_document_type(text):
     if not text:
         return None
     scores = {k: sum(1 for p in pats if p.search(text)) for k, pats in _DOC_TYPE_PATTERNS.items()}
+    for k, pats in _STRONG_PATTERNS.items():
+        scores[k] += STRONG_WEIGHT * sum(1 for p in pats if p.search(text))
     best = max(DOC_TYPE_PRIORITY, key=lambda k: (scores[k], -DOC_TYPE_PRIORITY.index(k)))
     return best if scores[best] > 0 else "Other"
 
 
 # ---------------------------------------------------------------------------
-# Document year (earliest 1940-2000 year from real date patterns)
+# Document year: the most frequent year among real dates (1940-2000).
+# Ties go to the latest year, because letters cite older events, not newer ones.
 # ---------------------------------------------------------------------------
 _MON = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?"
 DATE_PATTERNS = [
-    # 23 September 1947 / 22 Dec 47
-    re.compile(rf"\b\d{{1,2}}\s+{_MON},?\s+(\d{{4}}|\d{{2}})\b", re.IGNORECASE),
+    # 23 September 1947 / 22 Dec 47. The day must not be glued to a code by a
+    # hyphen or slash ("WF-L-29 APR 46" is a print code, not 29 Apr 1946).
+    re.compile(rf"(?<![\w/-])\d{{1,2}}\s+{_MON},?\s+(\d{{4}}|\d{{2}})\b", re.IGNORECASE),
     # Sep 23 1947 / DEC 19, 1947
     re.compile(rf"\b{_MON}\s+\d{{1,2}},?\s+(\d{{4}})\b", re.IGNORECASE),
     # NOV 1947
@@ -127,15 +165,18 @@ def _to_year(raw):
 def extract_doc_year(text):
     if not text:
         return None
-    years = []
+    years_by_pos = {}  # keyed by year position so overlapping patterns count once
     for pat in DATE_PATTERNS:
         for m in pat.finditer(text):
             if REVISION_PREFIX_RE.search(text[max(0, m.start() - 6):m.start()]):
                 continue
             y = _to_year(m.group(1))
             if y:
-                years.append(y)
-    return min(years) if years else None
+                years_by_pos[m.start(1)] = y
+    if not years_by_pos:
+        return None
+    counts = Counter(years_by_pos.values())
+    return max(counts, key=lambda y: (counts[y], y))
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +195,10 @@ ORG_TERMINAL_WORDS = {
     "COMMAND", "COMMANDS", "FORCE", "FORCES", "ARMY", "NAVY", "CORPS", "DIVISION", "WING",
     "GROUP", "SQUADRON", "BASE", "DEPARTMENT", "STAFF", "AGENCY", "CENTER", "CENTRE",
     "DISTRICT", "BUREAU", "SERVICE", "SERVICES", "ZONE", "AREA", "REGION",
+    "FIELD", "AIRFIELD", "STATION", "OFFICE", "LABORATORY", "INSTITUTE", "AFB",
 }
+ORG_UNIT_WORDS = {"COMMAND", "COMMANDS", "FORCE", "FORCES", "DIVISION", "WING", "GROUP", "SQUADRON",
+                  "DEPARTMENT", "STAFF", "AGENCY", "BUREAU", "CORPS"}
 KEEP_UPPER = {"USAF", "AAF", "AMC", "ADC", "SAC", "TAC", "ATC", "MATS", "AFB", "US", "USA",
               "USN", "CIA", "FBI", "ONI", "OSI", "AFOSI", "ATIC", "OIN"}
 
@@ -175,25 +219,43 @@ def _pretty(words):
     return " ".join(out)
 
 
+# "This Headquarters has contacted ..." uses the word as a noun, not a letterhead.
+HQ_NOUN_PREFIX_RE = re.compile(r"\b(?:this|these|that|the|your|our|their|its|to|by|from|at|of)\s*$",
+                               re.IGNORECASE)
+
+
 def _org_from_headquarters(text):
-    m = HQ_RE.search(text)
-    if not m:
-        return None
-    words = []
-    for raw in m.group(1).split():
-        tok = raw.strip(",.;:()")
-        if not tok or not re.fullmatch(r"[A-Za-z&'-]+", tok) or tok.upper() in ORG_STOP_WORDS:
-            break
-        words.append(tok)
-        if raw.endswith((",", ";", ":")) or len(words) >= 8:
-            break
-    # Trim trailing place names: cut back to the last organisational noun.
-    term = [i for i, w in enumerate(words) if w.upper() in ORG_TERMINAL_WORDS]
-    if term:
-        words = words[: term[-1] + 1]
-    if not words:
-        return None
-    return "Headquarters " + _pretty(words)
+    for m in HQ_RE.finditer(text):
+        if HQ_NOUN_PREFIX_RE.search(text[max(0, m.start() - 8):m.start()]):
+            continue
+        words = []
+        for raw in m.group(1).split():
+            tok = raw.strip(",.;:()")
+            if not tok or not re.fullmatch(r"[A-Za-z&'-]+", tok) or tok.upper() in ORG_STOP_WORDS:
+                break
+            # Org names are capitalised; a lowercase word means running prose.
+            if tok[0].islower() and tok.upper() not in SMALL_WORDS:
+                break
+            words.append(tok)
+            if raw.endswith((",", ";", ":")) or len(words) >= 8:
+                break
+        # Cut at the first unit noun (COMMAND, FORCES ...) so a trailing place
+        # ("... COMMAND WRIGHT FIELD") is dropped; otherwise keep up to the last
+        # installation noun ("KIRTLAND FIELD"). No such noun: not an org name.
+        upper = [w.upper() for w in words]
+        unit = [i for i, w in enumerate(upper) if w in ORG_UNIT_WORDS]
+        term = [i for i, w in enumerate(upper) if w in ORG_TERMINAL_WORDS]
+        if unit:
+            end = unit[0]
+            # "DEPARTMENT OF THE ARMY": follow an "of ..." phrase to its noun.
+            if end + 1 < len(upper) and upper[end + 1] == "OF":
+                nxt = [i for i in term if end + 1 < i <= end + 4]
+                if nxt:
+                    end = nxt[0]
+            return "Headquarters " + _pretty(words[: end + 1])
+        if term:
+            return "Headquarters " + _pretty(words[: term[-1] + 1])
+    return None
 
 
 def _org_from_from_line(text):

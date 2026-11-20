@@ -124,7 +124,9 @@ class TestExtractors(unittest.TestCase):
         self.assertEqual(e.extract_doc_year("Sep 23 1948"), 1948)
         self.assertEqual(e.extract_doc_year("on 9/23/47"), 1947)
         self.assertEqual(e.extract_doc_year("NOV 1949"), 1949)
-        self.assertEqual(e.extract_doc_year("NOV 1949 and 3 Jan 1952"), 1949)
+        # most frequent year wins; a tie goes to the latest (letters cite older events)
+        self.assertEqual(e.extract_doc_year("NOV 1949 and 3 Jan 1952"), 1952)
+        self.assertEqual(e.extract_doc_year("sighting 8 July 1946. 2 Oct 1947, ref 1 Oct 1947"), 1947)
         self.assertIsNone(e.extract_doc_year("12 May 2015"))
         # form-revision stamps are ignored
         self.assertEqual(e.extract_doc_year("(Rev 10 Sep 46) ... DEC 19 1947"), 1947)
