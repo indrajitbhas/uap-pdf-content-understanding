@@ -1,0 +1,86 @@
+{
+  "name": "search-1794236321638-indexer",
+  "dataSourceName": "search-1794236321638-datasource",
+  "skillsetName": "uap-combine-content",
+  "targetIndexName": "index1795026330751",
+  "parameters": {
+    "configuration": {
+      "parsingMode": "json",
+      "dataToExtract": "contentAndMetadata"
+    }
+  },
+  "fieldMappings": [
+    {
+      "sourceFieldName": "metadata_storage_name",
+      "targetFieldName": "title",
+      "mappingFunction": null
+    },
+    {
+      "sourceFieldName": "metadata_storage_path",
+      "targetFieldName": "id",
+      "mappingFunction": {
+        "name": "base64Encode",
+        "parameters": {
+          "useHttpServerUtilityUrlTokenEncode": false
+        }
+      }
+    }
+  ],
+  "outputFieldMappings": [
+    {
+      "sourceFieldName": "/document/contentText",
+      "targetFieldName": "context_text",
+      "mappingFunction": null
+    },
+    {
+      "sourceFieldName": "/document/pageFrom",
+      "targetFieldName": "pageFrom",
+      "mappingFunction": null
+    },
+    {
+      "sourceFieldName": "/document/pageTo",
+      "targetFieldName": "pageTo",
+      "mappingFunction": null
+    },
+    {
+      "sourceFieldName": "/document/sourcePdfName",
+      "targetFieldName": "sourcePdfName",
+      "mappingFunction": null
+    },
+    {
+      "sourceFieldName": "/document/naraRecordGroup",
+      "targetFieldName": "naraRecordGroup",
+      "mappingFunction": null
+    },
+    {
+      "sourceFieldName": "/document/naraItemNumber",
+      "targetFieldName": "naraItemNumber",
+      "mappingFunction": null
+    },
+    {
+      "sourceFieldName": "/document/declassificationAuthority",
+      "targetFieldName": "declassificationAuthority",
+      "mappingFunction": null
+    },
+    {
+      "sourceFieldName": "/document/classificationLevel",
+      "targetFieldName": "classificationLevel",
+      "mappingFunction": null
+    },
+    {
+      "sourceFieldName": "/document/documentType",
+      "targetFieldName": "documentType",
+      "mappingFunction": null
+    },
+    {
+      "sourceFieldName": "/document/docYear",
+      "targetFieldName": "docYear",
+      "mappingFunction": null
+    },
+    {
+      "sourceFieldName": "/document/originatingOrg",
+      "targetFieldName": "originatingOrg",
+      "mappingFunction": null
+    }
+  ]
+}

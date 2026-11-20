@@ -1,0 +1,87 @@
+[
+  {
+    "name": "naraRecordGroup",
+    "type": "Edm.String",
+    "searchable": false,
+    "filterable": true,
+    "retrievable": true,
+    "stored": true,
+    "sortable": true,
+    "facetable": true,
+    "key": false,
+    "synonymMaps": []
+  },
+  {
+    "name": "naraItemNumber",
+    "type": "Edm.String",
+    "searchable": false,
+    "filterable": true,
+    "retrievable": true,
+    "stored": true,
+    "sortable": true,
+    "facetable": true,
+    "key": false,
+    "synonymMaps": []
+  },
+  {
+    "name": "declassificationAuthority",
+    "type": "Edm.String",
+    "searchable": false,
+    "filterable": true,
+    "retrievable": true,
+    "stored": true,
+    "sortable": true,
+    "facetable": true,
+    "key": false,
+    "synonymMaps": []
+  },
+  {
+    "name": "classificationLevel",
+    "type": "Edm.String",
+    "searchable": false,
+    "filterable": true,
+    "retrievable": true,
+    "stored": true,
+    "sortable": true,
+    "facetable": true,
+    "key": false,
+    "synonymMaps": []
+  },
+  {
+    "name": "documentType",
+    "type": "Edm.String",
+    "searchable": false,
+    "filterable": true,
+    "retrievable": true,
+    "stored": true,
+    "sortable": true,
+    "facetable": true,
+    "key": false,
+    "synonymMaps": []
+  },
+  {
+    "name": "docYear",
+    "type": "Edm.Int32",
+    "searchable": false,
+    "filterable": true,
+    "retrievable": true,
+    "stored": true,
+    "sortable": true,
+    "facetable": true,
+    "key": false,
+    "synonymMaps": []
+  },
+  {
+    "name": "originatingOrg",
+    "type": "Edm.String",
+    "searchable": true,
+    "filterable": true,
+    "retrievable": true,
+    "stored": true,
+    "sortable": false,
+    "facetable": true,
+    "key": false,
+    "synonymMaps": [],
+    "analyzer": "en.microsoft"
+  }
+]

@@ -1,0 +1,79 @@
+{
+  "name": "uap-combine-content",
+  "description": "Combine curated page text, derive PDF provenance and Tier 1 metadata. One search record per curated JSON (no chunking, no projections).",
+  "skills": [
+    {
+      "@odata.type": "#Microsoft.Skills.Custom.WebApiSkill",
+      "name": "combine-pages",
+      "description": "Combine page text, derive PDF name/page range and Tier 1 regex metadata.",
+      "context": "/document",
+      "uri": "https://combinecontent.azurewebsites.net/api/combine",
+      "httpMethod": "POST",
+      "httpHeaders": {
+        "x-functions-key": "<FUNCTION_KEY>"
+      },
+      "timeout": "PT60S",
+      "batchSize": 1,
+      "inputs": [
+        {
+          "name": "pages",
+          "source": "/document/pages"
+        },
+        {
+          "name": "sourceJson",
+          "source": "/document/document/sourceJson"
+        },
+        {
+          "name": "fileName",
+          "source": "/document/document/fileName"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "contentText",
+          "targetName": "contentText"
+        },
+        {
+          "name": "pageFrom",
+          "targetName": "pageFrom"
+        },
+        {
+          "name": "pageTo",
+          "targetName": "pageTo"
+        },
+        {
+          "name": "sourcePdfName",
+          "targetName": "sourcePdfName"
+        },
+        {
+          "name": "naraRecordGroup",
+          "targetName": "naraRecordGroup"
+        },
+        {
+          "name": "naraItemNumber",
+          "targetName": "naraItemNumber"
+        },
+        {
+          "name": "declassificationAuthority",
+          "targetName": "declassificationAuthority"
+        },
+        {
+          "name": "classificationLevel",
+          "targetName": "classificationLevel"
+        },
+        {
+          "name": "documentType",
+          "targetName": "documentType"
+        },
+        {
+          "name": "docYear",
+          "targetName": "docYear"
+        },
+        {
+          "name": "originatingOrg",
+          "targetName": "originatingOrg"
+        }
+      ]
+    }
+  ]
+}
