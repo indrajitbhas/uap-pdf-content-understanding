@@ -151,7 +151,8 @@ DATE_PATTERNS = [
     re.compile(r"\b\d{1,2}/\d{1,2}/(\d{4}|\d{2})\b"),
 ]
 # Skip form-revision / print codes like "(Rev 10 Sep 46)".
-REVISION_PREFIX_RE = re.compile(r"\bRev\.?\s*$", re.IGNORECASE)
+REVISION_PREFIX_RE = re.compile(r"(?:\bRev\.?|\bv\.)\s*$", re.IGNORECASE)  # "Rev." or truncated "v."
+BARE_YEAR_RE = re.compile(r"(?<![\d-])(19\d\d)(?![\d-])")
 YEAR_MIN, YEAR_MAX = 1940, 2000
 
 
@@ -173,6 +174,10 @@ def extract_doc_year(text):
             y = _to_year(m.group(1))
             if y:
                 years_by_pos[m.start(1)] = y
+    if not years_by_pos:
+        # OCR splits dates ("AUG 2 9 1947"); fall back to bare four-digit years.
+        years_by_pos = {m.start(): int(m.group(1)) for m in BARE_YEAR_RE.finditer(text)
+                        if YEAR_MIN <= int(m.group(1)) <= YEAR_MAX}
     if not years_by_pos:
         return None
     counts = Counter(years_by_pos.values())
@@ -227,6 +232,13 @@ HQ_NOUN_PREFIX_RE = re.compile(r"\b(?:this|these|that|the|your|our|their|its|to|
 def _org_from_headquarters(text):
     for m in HQ_RE.finditer(text):
         if HQ_NOUN_PREFIX_RE.search(text[max(0, m.start() - 8):m.start()]):
+            continue
+        # Letterheads are typed in capitals ("HEADQUARTERS, Kirtland Field" or
+        # "Headquarters AIR MATERIEL COMMAND"). Mixed case on both sides is prose:
+        # "Headquarters, Army Air Forces issue a directive ..."
+        hq_word = text[m.start():m.start() + len("HEADQUARTERS")]
+        first = (m.group(1).split() or [""])[0].strip(",.;:()")
+        if not hq_word.isupper() and not first.isupper():
             continue
         words = []
         for raw in m.group(1).split():
